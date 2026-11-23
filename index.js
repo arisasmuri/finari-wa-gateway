@@ -23,9 +23,12 @@ app.use(session({
 }));
 
 const PORT = process.env.PORT || 3001;
-const CONFIG_FILE = path.join(__dirname, 'config.json');
 const AUTH_DIR = process.env.AUTH_DIR || './auth_info_baileys';
-const LOG_FILE = path.join(__dirname, 'logs.json');
+const DATA_DIR = process.env.DATA_DIR || AUTH_DIR;
+fs.ensureDirSync(DATA_DIR);
+
+const CONFIG_FILE = path.join(DATA_DIR, 'config.json');
+const LOG_FILE = path.join(DATA_DIR, 'logs.json');
 
 const DEFAULT_CONFIG = {
   dashboard_password: process.env.DASHBOARD_PASSWORD || 'FinAri2026',
@@ -35,7 +38,7 @@ const DEFAULT_CONFIG = {
   webhook_chaining: '',
   gateway_secret: process.env.GATEWAY_SECRET || 'WA_Bot_Finari2026',
   admin_number: process.env.ADMIN_NUMBER || '',
-  admin_lid: '',
+  admin_lid: process.env.ADMIN_LID || '',
   cc_outbound_to_admin: true,
   forward_customer_to_admin: true,
   auto_read: false,
@@ -135,15 +138,43 @@ async function resolveAdminDestJid(config) {
   return adminJid;
 }
 
+async function resolveTargetJid(rawTarget) {
+  let jid = String(rawTarget || '').trim();
+  if (!jid.includes('@')) {
+    const cleanNum = normalizePhone(jid);
+    jid = `${cleanNum}@s.whatsapp.net`;
+  }
+
+  if (jid.endsWith('@s.whatsapp.net') && sock?.signalRepository?.lidMapping?.getLIDForPN) {
+    try {
+      const mappedLid = await sock.signalRepository.lidMapping.getLIDForPN(jid);
+      if (mappedLid) return mappedLid;
+    } catch {}
+  }
+
+  if (jid.endsWith('@s.whatsapp.net') && sock?.onWhatsApp) {
+    try {
+      const [res] = await sock.onWhatsApp(jid);
+      if (res?.lid) return res.lid;
+    } catch {}
+  }
+
+  return jid;
+}
+
 async function startWhatsAppGateway() {
   const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR);
   const { version } = await fetchLatestBaileysVersion();
 
-  sock = makeWASocket({
+sock = makeWASocket({
     version,
     auth: state,
+    browser: ['Ubuntu', 'Chrome', '20.0.04'],
     printQRInTerminal: false,
-    syncFullHistory: false
+    syncFullHistory: false,
+    markOnlineOnConnect: true,
+    generateHighQualityLinkPreview: false,
+    getMessage: async () => undefined
   });
   sock.ev.on('creds.update', saveCreds);
 
@@ -1053,12 +1084,14 @@ app.post('/send-manual', requireLogin, async (req, res) => {
   try {
     const config = getConfig();
     const num = normalizePhone(req.body.number);
-    const jid = `${num}@s.whatsapp.net`;
+    const jid = await resolveTargetJid(num);
     const message = req.body.message;
 
     console.log(`[WA Gateway] Manual Sending to JID: ${jid}`);
     await sock.sendMessage(jid, { text: message });
     addLog('outbound', num, message);
+
+    await new Promise(r => setTimeout(r, 1000));
     await sendAdminCC(jid, message, config);
 
     res.redirect('/send?sent=1');
@@ -1098,15 +1131,13 @@ app.post('/send', async (req, res) => {
       return res.status(503).json({ status: false, reason: 'WA Gateway Offline' });
     }
 
-    let jid = target;
-    if (!jid.includes('@')) {
-      const cleanNum = normalizePhone(jid);
-      jid = `${cleanNum}@s.whatsapp.net`;
-    }
+    const jid = await resolveTargetJid(target);
 
     console.log(`[WA Gateway] Sending to JID: ${jid}`);
     await sock.sendMessage(jid, { text: message });
     addLog('outbound', jid.split('@')[0], message);
+
+    await new Promise(r => setTimeout(r, 1000));
     await sendAdminCC(jid, message, config);
 
     let lid = null;
