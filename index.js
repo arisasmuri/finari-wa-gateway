@@ -995,8 +995,18 @@ async function sendAdminCC(targetJid, message, config) {
   if (!config.cc_outbound_to_admin || !adminJid || targetJid === adminJid) return;
 
   try {
-    console.log(`[WA Gateway] Mengirim CC ke Admin: ${adminJid}`);
-    await sock.sendMessage(adminJid, {
+    let destJid = adminJid;
+
+    // Cek apakah ada mapping LID untuk nomor admin agar enkripsi multi-device cocok
+    if (sock.signalRepository?.lidMapping?.getLIDForPN) {
+      try {
+        const mappedLid = await sock.signalRepository.lidMapping.getLIDForPN(adminJid);
+        if (mappedLid) destJid = mappedLid;
+      } catch {}
+    }
+
+    console.log(`[WA Gateway] Mengirim CC ke Admin: ${destJid}`);
+    await sock.sendMessage(destJid, {
       text: `📤 *[CC Pesan Keluar]*\nTujuan: ${targetJid.split('@')[0]}\n\n${message}`
     });
     console.log(`[WA Gateway] ✅ CC ke Admin berhasil terkirim`);
