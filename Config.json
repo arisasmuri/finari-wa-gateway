@@ -1,0 +1,17 @@
+{
+  "dashboard_password": "FinAri2026",
+  "webhook_url": "https://finari.arisasmuri.my.id/api/whatsapp/webhook",
+  "webhook_connect": "",
+  "webhook_message_status": "",
+  "webhook_chaining": "",
+  "gateway_secret": "WA_Bot_Finari2026",
+  "auto_read": false,
+  "silent_read": false,
+  "inbox": true,
+  "autoreply_personal": true,
+  "autoreply_group": false,
+  "quick_reply": false,
+  "forward_attachment": false,
+  "forward_attachment_number": "",
+  "autodelete_message": false
+}
