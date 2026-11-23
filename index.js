@@ -989,14 +989,38 @@ app.get('/send', requireLogin, (req, res) => {
   res.send(getLayout('Kirim Pesan', content, 'send'));
 });
 
+async function sendAdminCC(targetJid, message, config) {
+  const adminNum = normalizePhone(config.admin_number);
+  const adminJid = adminNum ? `${adminNum}@s.whatsapp.net` : null;
+  if (!config.cc_outbound_to_admin || !adminJid || targetJid === adminJid) return;
+
+  try {
+    console.log(`[WA Gateway] Mengirim CC ke Admin: ${adminJid}`);
+    await sock.sendMessage(adminJid, {
+      text: `📤 *[CC Pesan Keluar]*\nTujuan: ${targetJid.split('@')[0]}\n\n${message}`
+    });
+    console.log(`[WA Gateway] ✅ CC ke Admin berhasil terkirim`);
+  } catch (ccErr) {
+    console.error('[WA Gateway] ❌ Gagal kirim CC ke admin:', ccErr);
+  }
+}
+
 app.post('/send-manual', requireLogin, async (req, res) => {
   if (!isConnected || !sock) return res.redirect('/send?error=1');
   try {
+    const config = getConfig();
     const num = normalizePhone(req.body.number);
-    await sock.sendMessage(`${num}@s.whatsapp.net`, { text: req.body.message });
-    addLog('outbound', num, req.body.message);
+    const jid = `${num}@s.whatsapp.net`;
+    const message = req.body.message;
+
+    console.log(`[WA Gateway] Manual Sending to JID: ${jid}`);
+    await sock.sendMessage(jid, { text: message });
+    addLog('outbound', num, message);
+    await sendAdminCC(jid, message, config);
+
     res.redirect('/send?sent=1');
   } catch (err) {
+    console.error('[WA Gateway Manual Send Error]', err);
     res.redirect('/send?error=1');
   }
 });
@@ -1031,7 +1055,6 @@ app.post('/send', async (req, res) => {
       return res.status(503).json({ status: false, reason: 'WA Gateway Offline' });
     }
 
-    // Support format @lid dan @s.whatsapp.net
     let jid = target;
     if (!jid.includes('@')) {
       const cleanNum = normalizePhone(jid);
@@ -1041,21 +1064,8 @@ app.post('/send', async (req, res) => {
     console.log(`[WA Gateway] Sending to JID: ${jid}`);
     await sock.sendMessage(jid, { text: message });
     addLog('outbound', jid.split('@')[0], message);
+    await sendAdminCC(jid, message, config);
 
-    // CC salinan pesan keluar (tagihan) ke Nomor Admin A
-    const adminNum = normalizePhone(config.admin_number);
-    const adminJid = adminNum ? `${adminNum}@s.whatsapp.net` : null;
-    if (config.cc_outbound_to_admin && adminJid && jid !== adminJid) {
-      try {
-        await sock.sendMessage(adminJid, {
-          text: `📤 *[CC Pesan Keluar]*\nTujuan: ${jid.split('@')[0]}\n\n${message}`
-        });
-      } catch (ccErr) {
-        console.error('[WA Gateway] Gagal kirim CC ke admin:', ccErr.message);
-      }
-    }
-
-    // Ambil lid jika tersedia untuk bantu FinAri mapping debitur
     let lid = null;
     if (!jid.endsWith('@lid') && sock.signalRepository?.lidMapping?.getLIDForPN) {
       try {
