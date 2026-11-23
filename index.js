@@ -1106,7 +1106,20 @@ app.get('/disconnect', requireLogin, async (req, res) => {
   try { await sock?.logout(); } catch (e) {}
   isConnected = false;
   qrCodeString = null;
-  await fs.remove(AUTH_DIR);
+
+  try {
+    if (await fs.pathExists(AUTH_DIR)) {
+      const files = await fs.readdir(AUTH_DIR);
+      for (const file of files) {
+        if (file !== 'config.json' && file !== 'logs.json') {
+          await fs.remove(path.join(AUTH_DIR, file));
+        }
+      }
+    }
+  } catch (err) {
+    console.error('[WA Gateway] Gagal membersihkan file sesi:', err.message);
+  }
+
   setTimeout(startWhatsAppGateway, 2000);
   res.redirect('/');
 });
