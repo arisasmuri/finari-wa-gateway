@@ -27,9 +27,51 @@ const CONFIG_FILE = path.join(__dirname, 'config.json');
 const AUTH_DIR = process.env.AUTH_DIR || './auth_info_baileys';
 const LOG_FILE = path.join(__dirname, 'logs.json');
 
+const DEFAULT_CONFIG = {
+  dashboard_password: process.env.DASHBOARD_PASSWORD || 'FinAri2026',
+  webhook_url: process.env.WEBHOOK_URL || 'https://finari.arisasmuri.my.id/api/whatsapp/webhook',
+  webhook_connect: '',
+  webhook_message_status: '',
+  webhook_chaining: '',
+  gateway_secret: process.env.GATEWAY_SECRET || 'WA_Bot_Finari2026',
+  admin_number: process.env.ADMIN_NUMBER || '',
+  cc_outbound_to_admin: true,
+  forward_customer_to_admin: true,
+  auto_read: false,
+  silent_read: false,
+  inbox: true,
+  autoreply_personal: true,
+  autoreply_group: false,
+  quick_reply: false,
+  forward_attachment: false,
+  forward_attachment_number: '',
+  autodelete_message: false
+};
+
 let sock = null;
 let qrCodeString = null;
 let isConnected = false;
+
+// Deduplikasi ID pesan agar tidak tercatat / terkirim ganda saat Baileys retry/resync
+const processedMessageIds = new Set();
+
+function isDuplicateMessage(id) {
+  if (!id) return false;
+  if (processedMessageIds.has(id)) return true;
+  processedMessageIds.add(id);
+  if (processedMessageIds.size > 1000) {
+    const firstKey = processedMessageIds.values().next().value;
+    processedMessageIds.delete(firstKey);
+  }
+  return false;
+}
+
+function normalizePhone(raw) {
+  if (!raw) return '';
+  let num = String(raw).split('@')[0].split(':')[0].replace(/[^0-9]/g, '');
+  if (num.startsWith('0')) num = '62' + num.slice(1);
+  return num;
+}
 
 function loadLogs() {
   try {
@@ -45,7 +87,11 @@ function saveLogs() {
 let messageLogs = loadLogs();
 
 function getConfig() {
-  return fs.readJsonSync(CONFIG_FILE);
+  if (!fs.existsSync(CONFIG_FILE)) {
+    fs.writeJsonSync(CONFIG_FILE, DEFAULT_CONFIG, { spaces: 2 });
+    return { ...DEFAULT_CONFIG };
+  }
+  return { ...DEFAULT_CONFIG, ...fs.readJsonSync(CONFIG_FILE) };
 }
 
 function saveConfig(data) {
@@ -56,7 +102,7 @@ function addLog(type, from, message) {
   const log = {
     type,
     from,
-    message: message.substring(0, 300),
+    message: String(message || '').substring(0, 300),
     time: new Date().toLocaleString('id-ID', { timeZone: 'Asia/Jakarta' })
   };
   messageLogs.unshift(log);
@@ -73,7 +119,12 @@ async function startWhatsAppGateway() {
   const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR);
   const { version } = await fetchLatestBaileysVersion();
 
-  sock = makeWASocket({ version, auth: state, printQRInTerminal: false });
+  sock = makeWASocket({
+    version,
+    auth: state,
+    printQRInTerminal: false,
+    syncFullHistory: false
+  });
   sock.ev.on('creds.update', saveCreds);
 
   sock.ev.on('connection.update', (update) => {
@@ -122,10 +173,13 @@ async function startWhatsAppGateway() {
       const config = getConfig();
 
       for (const msg of m.messages) {
+        // Lewati pesan kosong (gagal decrypt / protocol message) & pesan duplikat
+        if (!msg.message) continue;
+        if (isDuplicateMessage(msg.key.id)) continue;
         if (msg.key.fromMe && !config.quick_reply) continue;
 
         const remoteJid = msg.key.remoteJid;
-        if (!remoteJid) continue;
+        if (!remoteJid || remoteJid === 'status@broadcast') continue;
 
         const isGroup = remoteJid.endsWith('@g.us');
         if (isGroup && !config.autoreply_group) continue;
@@ -137,32 +191,64 @@ async function startWhatsAppGateway() {
           await sock.readMessages([msg.key]);
         }
 
-        let textMessage = msg.message?.conversation || msg.message?.extendedTextMessage?.text || '';
-        let fileUrl = '';
+        // Ekstrak isi pesan teks / caption / balasan
+        const unwrapMsg = msg.message?.ephemeralMessage?.message
+          || msg.message?.viewOnceMessage?.message
+          || msg.message?.viewOnceMessageV2?.message
+          || msg.message;
 
-        const imageMessage = msg.message?.imageMessage;
+        let textMessage = unwrapMsg?.conversation
+          || unwrapMsg?.extendedTextMessage?.text
+          || unwrapMsg?.imageMessage?.caption
+          || unwrapMsg?.videoMessage?.caption
+          || unwrapMsg?.documentMessage?.caption
+          || '';
+
+        let fileUrl = '';
+        let mediaType = 'text';
+        let mediaBuffer = null;
+
+        const imageMessage = unwrapMsg?.imageMessage;
+        const audioMessage = unwrapMsg?.audioMessage;
+
         if (imageMessage) {
+          mediaType = 'image';
           try {
-            const buffer = await downloadMediaMessage(msg, 'buffer', {}, {
+            mediaBuffer = await downloadMediaMessage(msg, 'buffer', {}, {
               logger: console,
               reuploadRequest: sock.updateMediaMessage
             });
             const mimeType = imageMessage.mimetype || 'image/jpeg';
-            fileUrl = `data:${mimeType};base64,${buffer.toString('base64')}`;
-            if (!textMessage) textMessage = imageMessage.caption || '';
+            fileUrl = `data:${mimeType};base64,${mediaBuffer.toString('base64')}`;
 
             if (config.forward_attachment && config.forward_attachment_number) {
-              let fwNum = config.forward_attachment_number.replace(/[^0-9]/g, '');
-              if (fwNum.startsWith('0')) fwNum = '62' + fwNum.slice(1);
-              await sock.sendMessage(`${fwNum}@s.whatsapp.net`, {
-                image: buffer,
-                caption: textMessage || ''
-              });
+              const fwNum = normalizePhone(config.forward_attachment_number);
+              if (fwNum) {
+                await sock.sendMessage(`${fwNum}@s.whatsapp.net`, {
+                  image: mediaBuffer,
+                  caption: textMessage || ''
+                });
+              }
             }
           } catch (err) {
-            console.error('[WA Gateway] Gagal download media:', err);
+            console.error('[WA Gateway] Gagal download gambar:', err);
+          }
+        } else if (audioMessage) {
+          mediaType = 'audio';
+          try {
+            mediaBuffer = await downloadMediaMessage(msg, 'buffer', {}, {
+              logger: console,
+              reuploadRequest: sock.updateMediaMessage
+            });
+            const mimeType = audioMessage.mimetype || 'audio/ogg; codecs=opus';
+            fileUrl = `data:${mimeType};base64,${mediaBuffer.toString('base64')}`;
+          } catch (err) {
+            console.error('[WA Gateway] Gagal download audio:', err);
           }
         }
+
+        // Abaikan jika pesan tidak memiliki teks maupun media valid (misal reaction/receipt)
+        if (!textMessage && !mediaBuffer && mediaType === 'text') continue;
 
         // Ambil senderPn dari berbagai sumber termasuk lidMapping
         let senderPn = msg.key.senderPn || msg.key.participantPn || '';
@@ -174,11 +260,98 @@ async function startWhatsAppGateway() {
 
         const pushName = msg.pushName || '';
         const messageId = msg.key.id || '';
+        const cleanSenderNum = normalizePhone(senderPn || sender);
+        const adminNum = normalizePhone(config.admin_number);
+        const adminJid = adminNum ? `${adminNum}@s.whatsapp.net` : null;
 
-        console.log(`[WA Gateway] Forward ke FinAri dari: ${sender} | senderPn: ${senderPn} | pushName: ${pushName}`);
+        // ============================================================
+        // 1. JIKA PESAN DARI NOMOR ADMIN (A) -> CEK KONFIRMASI TRANSAKSI
+        // ============================================================
+        if (adminJid && cleanSenderNum === adminNum && !isGroup) {
+          const contextInfo = unwrapMsg?.extendedTextMessage?.contextInfo;
+          const quotedMsg = contextInfo?.quotedMessage;
+          const quotedText = quotedMsg?.conversation
+            || quotedMsg?.extendedTextMessage?.text
+            || quotedMsg?.imageMessage?.caption
+            || '';
+
+          const isConfirmCmd = /^(lunas|acc|masuk|ok|sah|valid|konfirmasi)\b/i.test(textMessage.trim());
+
+          if (isConfirmCmd) {
+            const matchTarget = textMessage.match(/(628[0-9]{7,13}|08[0-9]{7,13})/)
+              || quotedText.match(/(628[0-9]{7,13}|08[0-9]{7,13})/);
+            const customerNumber = matchTarget ? normalizePhone(matchTarget[1]) : '';
+
+            console.log(`[WA Gateway] Konfirmasi Admin (${adminNum}) -> Pelanggan: ${customerNumber || 'tidak terdeteksi'}`);
+
+            if (config.inbox) {
+              addLog('inbound', `ADMIN (${adminNum})`, `[KONFIRMASI] ${textMessage}${customerNumber ? ` -> ${customerNumber}` : ''}`);
+            }
+
+            if (config.webhook_url) {
+              fetch(config.webhook_url, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                  source: 'admin_confirmation',
+                  sender,
+                  senderPn: adminJid,
+                  pushName,
+                  messageId,
+                  message: textMessage,
+                  customerNumber,
+                  quotedText
+                })
+              }).catch(err => console.error('[WA Gateway] Webhook admin error:', err.message));
+            }
+
+            await sock.sendMessage(adminJid, {
+              text: `✅ *Konfirmasi Diterima*\nPelanggan: ${customerNumber || '(tidak terdeteksi, cek di FinAri)'}\nPerintah: ${textMessage}\nStatus: Diteruskan ke sistem FinAri.`
+            });
+
+            continue;
+          }
+        }
+
+        // ============================================================
+        // 2. TERUSKAN PESAN PELANGGAN (TEKS / GAMBAR / AUDIO) KE ADMIN (A)
+        // ============================================================
+        if (config.forward_customer_to_admin && adminJid && cleanSenderNum !== adminNum && !isGroup) {
+          try {
+            const headerInfo = `📥 *[Pesan Pelanggan]*\nNama: ${pushName || '-'}\nNomor: ${cleanSenderNum || sender}`;
+
+            if (mediaType === 'image' && mediaBuffer) {
+              await sock.sendMessage(adminJid, {
+                image: mediaBuffer,
+                caption: `${headerInfo}\nPesan: ${textMessage || '[Gambar]'}\n\n_Reply pesan ini dengan "LUNAS" jika transaksi sudah masuk._`
+              });
+            } else if (mediaType === 'audio' && mediaBuffer) {
+              await sock.sendMessage(adminJid, {
+                text: `${headerInfo}\nPesan: [Pesan Suara / Audio]\n\n_Reply pesan ini dengan "LUNAS" jika transaksi sudah masuk._`
+              });
+              await sock.sendMessage(adminJid, {
+                audio: mediaBuffer,
+                mimetype: audioMessage?.mimetype || 'audio/mp4',
+                ptt: audioMessage?.ptt || false
+              });
+            } else if (textMessage) {
+              await sock.sendMessage(adminJid, {
+                text: `${headerInfo}\n\n${textMessage}\n\n_Reply pesan ini dengan "LUNAS" jika transaksi sudah masuk._`
+              });
+            }
+          } catch (fwdErr) {
+            console.error('[WA Gateway] Gagal forward pesan pelanggan ke admin:', fwdErr.message);
+          }
+        }
+
+        // ============================================================
+        // 3. TERUSKAN KE WEBHOOK FINARI
+        // ============================================================
+        const logSummary = textMessage || (mediaType === 'image' ? '[gambar]' : mediaType === 'audio' ? '[audio]' : '[pesan]');
+        console.log(`[WA Gateway] Forward ke FinAri dari: ${sender} | senderPn: ${senderPn} | type: ${mediaType}`);
 
         if (config.inbox) {
-          addLog('inbound', senderPn || sender, textMessage || '[gambar]');
+          addLog('inbound', cleanSenderNum || sender, logSummary);
         }
 
         if (config.webhook_url) {
@@ -190,6 +363,7 @@ async function startWhatsAppGateway() {
               senderPn,
               pushName,
               messageId,
+              mediaType,
               message: textMessage,
               url: fileUrl
             })
@@ -200,7 +374,16 @@ async function startWhatsAppGateway() {
           fetch(config.webhook_chaining, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ sender, senderPn, pushName, messageId, message: textMessage, url: fileUrl, source: 'chaining' })
+            body: JSON.stringify({
+              sender,
+              senderPn,
+              pushName,
+              messageId,
+              mediaType,
+              message: textMessage,
+              url: fileUrl,
+              source: 'chaining'
+            })
           }).catch(() => {});
         }
 
@@ -635,6 +818,21 @@ app.get('/settings', requireLogin, (req, res) => {
       <div class="gap-16">
 
         <div class="card">
+          <div class="card-header"><span class="card-title">Admin & Monitoring (Nomor A)</span></div>
+          <div class="gap-16">
+            <div class="form-group">
+              <label class="field-label">Nomor WhatsApp Admin (Nomor A)</label>
+              <input type="tel" name="admin_number" value="${config.admin_number || ''}" placeholder="628123456789" />
+              <p class="input-hint">Nomor penerima CC tagihan keluar, terusan pesan pelanggan, dan pengirim perintah LUNAS.</p>
+            </div>
+            <div class="grid-2">
+              ${toggle('cc_outbound_to_admin', 'CC Tagihan Keluar ke Admin', 'Kirim salinan setiap tagihan keluar dari FinAri ke nomor Admin A')}
+              ${toggle('forward_customer_to_admin', 'Teruskan Balasan Pelanggan', 'Forward chat teks, gambar, & audio pelanggan ke nomor Admin A')}
+            </div>
+          </div>
+        </div>
+
+        <div class="card">
           <div class="card-header"><span class="card-title">Webhook</span></div>
           <div class="gap-16">
             <div class="form-group">
@@ -704,6 +902,9 @@ app.get('/settings', requireLogin, (req, res) => {
 
 app.post('/save-config', requireLogin, (req, res) => {
   const config = getConfig();
+  config.admin_number = normalizePhone(req.body.admin_number || '');
+  config.cc_outbound_to_admin = req.body.cc_outbound_to_admin === 'on';
+  config.forward_customer_to_admin = req.body.forward_customer_to_admin === 'on';
   config.webhook_url = req.body.webhook_url || '';
   config.webhook_connect = req.body.webhook_connect || '';
   config.webhook_message_status = req.body.webhook_message_status || '';
@@ -791,8 +992,7 @@ app.get('/send', requireLogin, (req, res) => {
 app.post('/send-manual', requireLogin, async (req, res) => {
   if (!isConnected || !sock) return res.redirect('/send?error=1');
   try {
-    let num = req.body.number.replace(/[^0-9]/g, '');
-    if (num.startsWith('0')) num = '62' + num.slice(1);
+    const num = normalizePhone(req.body.number);
     await sock.sendMessage(`${num}@s.whatsapp.net`, { text: req.body.message });
     addLog('outbound', num, req.body.message);
     res.redirect('/send?sent=1');
@@ -806,8 +1006,7 @@ app.get('/disconnect', requireLogin, async (req, res) => {
   try { await sock?.logout(); } catch (e) {}
   isConnected = false;
   qrCodeString = null;
-  const authPath = path.join(__dirname, 'auth_info_baileys');
-  await fs.remove(authPath);
+  await fs.remove(AUTH_DIR);
   setTimeout(startWhatsAppGateway, 2000);
   res.redirect('/');
 });
@@ -835,14 +1034,26 @@ app.post('/send', async (req, res) => {
     // Support format @lid dan @s.whatsapp.net
     let jid = target;
     if (!jid.includes('@')) {
-      let cleanNum = jid.replace(/[^0-9]/g, '');
-      if (cleanNum.startsWith('0')) cleanNum = '62' + cleanNum.slice(1);
+      const cleanNum = normalizePhone(jid);
       jid = `${cleanNum}@s.whatsapp.net`;
     }
 
     console.log(`[WA Gateway] Sending to JID: ${jid}`);
     await sock.sendMessage(jid, { text: message });
     addLog('outbound', jid.split('@')[0], message);
+
+    // CC salinan pesan keluar (tagihan) ke Nomor Admin A
+    const adminNum = normalizePhone(config.admin_number);
+    const adminJid = adminNum ? `${adminNum}@s.whatsapp.net` : null;
+    if (config.cc_outbound_to_admin && adminJid && jid !== adminJid) {
+      try {
+        await sock.sendMessage(adminJid, {
+          text: `📤 *[CC Pesan Keluar]*\nTujuan: ${jid.split('@')[0]}\n\n${message}`
+        });
+      } catch (ccErr) {
+        console.error('[WA Gateway] Gagal kirim CC ke admin:', ccErr.message);
+      }
+    }
 
     // Ambil lid jika tersedia untuk bantu FinAri mapping debitur
     let lid = null;
