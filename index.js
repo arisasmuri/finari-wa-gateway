@@ -35,6 +35,7 @@ const DEFAULT_CONFIG = {
   webhook_chaining: '',
   gateway_secret: process.env.GATEWAY_SECRET || 'WA_Bot_Finari2026',
   admin_number: process.env.ADMIN_NUMBER || '',
+  admin_lid: '',
   cc_outbound_to_admin: true,
   forward_customer_to_admin: true,
   auto_read: false,
@@ -113,6 +114,25 @@ function addLog(type, from, message) {
 function requireLogin(req, res, next) {
   if (req.session.loggedIn) return next();
   res.redirect('/login');
+}
+
+async function resolveAdminDestJid(config) {
+  const adminNum = normalizePhone(config.admin_number);
+  const adminJid = adminNum ? `${adminNum}@s.whatsapp.net` : null;
+  if (!adminJid) return null;
+  if (config.admin_lid) return config.admin_lid;
+
+  if (sock?.signalRepository?.lidMapping?.getLIDForPN) {
+    try {
+      const mappedLid = await sock.signalRepository.lidMapping.getLIDForPN(adminJid);
+      if (mappedLid) {
+        config.admin_lid = mappedLid;
+        saveConfig(config);
+        return mappedLid;
+      }
+    } catch {}
+  }
+  return adminJid;
 }
 
 async function startWhatsAppGateway() {
@@ -264,10 +284,24 @@ async function startWhatsAppGateway() {
         const adminNum = normalizePhone(config.admin_number);
         const adminJid = adminNum ? `${adminNum}@s.whatsapp.net` : null;
 
+        // Simpan otomatis LID milik Admin A ke config.json agar CC & forward selalu akurat
+        if (adminJid && cleanSenderNum === adminNum && sender.endsWith('@lid') && config.admin_lid !== sender) {
+          config.admin_lid = sender;
+          saveConfig(config);
+          console.log(`[WA Gateway] 📌 Menyimpan Admin LID: ${sender}`);
+        }
+
+        const isFromAdmin = Boolean(
+          adminNum && !isGroup && (
+            cleanSenderNum === adminNum ||
+            (config.admin_lid && sender === config.admin_lid)
+          )
+        );
+
         // ============================================================
         // 1. JIKA PESAN DARI NOMOR ADMIN (A) -> CEK KONFIRMASI TRANSAKSI
         // ============================================================
-        if (adminJid && cleanSenderNum === adminNum && !isGroup) {
+        if (isFromAdmin) {
           const contextInfo = unwrapMsg?.extendedTextMessage?.contextInfo;
           const quotedMsg = contextInfo?.quotedMessage;
           const quotedText = quotedMsg?.conversation
@@ -305,9 +339,12 @@ async function startWhatsAppGateway() {
               }).catch(err => console.error('[WA Gateway] Webhook admin error:', err.message));
             }
 
-            await sock.sendMessage(adminJid, {
-              text: `✅ *Konfirmasi Diterima*\nPelanggan: ${customerNumber || '(tidak terdeteksi, cek di FinAri)'}\nPerintah: ${textMessage}\nStatus: Diteruskan ke sistem FinAri.`
-            });
+            const replyAdminJid = await resolveAdminDestJid(config);
+            if (replyAdminJid) {
+              await sock.sendMessage(replyAdminJid, {
+                text: `✅ *Konfirmasi Diterima*\nPelanggan: ${customerNumber || '(tidak terdeteksi, cek di FinAri)'}\nPerintah: ${textMessage}\nStatus: Diteruskan ke sistem FinAri.`
+              });
+            }
 
             continue;
           }
@@ -316,26 +353,27 @@ async function startWhatsAppGateway() {
         // ============================================================
         // 2. TERUSKAN PESAN PELANGGAN (TEKS / GAMBAR / AUDIO) KE ADMIN (A)
         // ============================================================
-        if (config.forward_customer_to_admin && adminJid && cleanSenderNum !== adminNum && !isGroup) {
+        if (config.forward_customer_to_admin && adminJid && !isFromAdmin && !isGroup) {
           try {
+            const destAdminJid = await resolveAdminDestJid(config);
             const headerInfo = `📥 *[Pesan Pelanggan]*\nNama: ${pushName || '-'}\nNomor: ${cleanSenderNum || sender}`;
 
             if (mediaType === 'image' && mediaBuffer) {
-              await sock.sendMessage(adminJid, {
+              await sock.sendMessage(destAdminJid, {
                 image: mediaBuffer,
                 caption: `${headerInfo}\nPesan: ${textMessage || '[Gambar]'}\n\n_Reply pesan ini dengan "LUNAS" jika transaksi sudah masuk._`
               });
             } else if (mediaType === 'audio' && mediaBuffer) {
-              await sock.sendMessage(adminJid, {
+              await sock.sendMessage(destAdminJid, {
                 text: `${headerInfo}\nPesan: [Pesan Suara / Audio]\n\n_Reply pesan ini dengan "LUNAS" jika transaksi sudah masuk._`
               });
-              await sock.sendMessage(adminJid, {
+              await sock.sendMessage(destAdminJid, {
                 audio: mediaBuffer,
                 mimetype: audioMessage?.mimetype || 'audio/mp4',
                 ptt: audioMessage?.ptt || false
               });
             } else if (textMessage) {
-              await sock.sendMessage(adminJid, {
+              await sock.sendMessage(destAdminJid, {
                 text: `${headerInfo}\n\n${textMessage}\n\n_Reply pesan ini dengan "LUNAS" jika transaksi sudah masuk._`
               });
             }
@@ -823,7 +861,7 @@ app.get('/settings', requireLogin, (req, res) => {
             <div class="form-group">
               <label class="field-label">Nomor WhatsApp Admin (Nomor A)</label>
               <input type="tel" name="admin_number" value="${config.admin_number || ''}" placeholder="628123456789" />
-              <p class="input-hint">Nomor penerima CC tagihan keluar, terusan pesan pelanggan, dan pengirim perintah LUNAS.</p>
+              <p class="input-hint">Nomor penerima CC tagihan keluar, terusan pesan pelanggan, dan pengirim perintah LUNAS.${config.admin_lid ? ` (LID terekam: ${config.admin_lid})` : ''}</p>
             </div>
             <div class="grid-2">
               ${toggle('cc_outbound_to_admin', 'CC Tagihan Keluar ke Admin', 'Kirim salinan setiap tagihan keluar dari FinAri ke nomor Admin A')}
@@ -902,7 +940,11 @@ app.get('/settings', requireLogin, (req, res) => {
 
 app.post('/save-config', requireLogin, (req, res) => {
   const config = getConfig();
-  config.admin_number = normalizePhone(req.body.admin_number || '');
+  const newAdminNum = normalizePhone(req.body.admin_number || '');
+  if (newAdminNum !== config.admin_number) {
+    config.admin_lid = ''; // Reset LID lama jika nomor admin diganti
+  }
+  config.admin_number = newAdminNum;
   config.cc_outbound_to_admin = req.body.cc_outbound_to_admin === 'on';
   config.forward_customer_to_admin = req.body.forward_customer_to_admin === 'on';
   config.webhook_url = req.body.webhook_url || '';
@@ -992,19 +1034,10 @@ app.get('/send', requireLogin, (req, res) => {
 async function sendAdminCC(targetJid, message, config) {
   const adminNum = normalizePhone(config.admin_number);
   const adminJid = adminNum ? `${adminNum}@s.whatsapp.net` : null;
-  if (!config.cc_outbound_to_admin || !adminJid || targetJid === adminJid) return;
+  if (!config.cc_outbound_to_admin || !adminJid || targetJid === adminJid || (config.admin_lid && targetJid === config.admin_lid)) return;
 
   try {
-    let destJid = adminJid;
-
-    // Cek apakah ada mapping LID untuk nomor admin agar enkripsi multi-device cocok
-    if (sock.signalRepository?.lidMapping?.getLIDForPN) {
-      try {
-        const mappedLid = await sock.signalRepository.lidMapping.getLIDForPN(adminJid);
-        if (mappedLid) destJid = mappedLid;
-      } catch {}
-    }
-
+    const destJid = await resolveAdminDestJid(config);
     console.log(`[WA Gateway] Mengirim CC ke Admin: ${destJid}`);
     await sock.sendMessage(destJid, {
       text: `📤 *[CC Pesan Keluar]*\nTujuan: ${targetJid.split('@')[0]}\n\n${message}`
