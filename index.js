@@ -119,6 +119,21 @@ function requireLogin(req, res, next) {
   res.redirect('/login');
 }
 
+async function clearSessionFiles() {
+  try {
+    if (await fs.pathExists(AUTH_DIR)) {
+      const files = await fs.readdir(AUTH_DIR);
+      for (const file of files) {
+        if (file !== 'config.json' && file !== 'logs.json') {
+          await fs.remove(path.join(AUTH_DIR, file));
+        }
+      }
+    }
+  } catch (err) {
+    console.error('[WA Gateway] Gagal membersihkan file sesi:', err.message);
+  }
+}
+
 async function resolveAdminDestJid(config) {
   const adminNum = normalizePhone(config.admin_number);
   const adminJid = adminNum ? `${adminNum}@s.whatsapp.net` : null;
@@ -166,7 +181,7 @@ async function startWhatsAppGateway() {
   const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR);
   const { version } = await fetchLatestBaileysVersion();
 
-sock = makeWASocket({
+  sock = makeWASocket({
     version,
     auth: state,
     browser: ['Ubuntu', 'Chrome', '20.0.04'],
@@ -176,9 +191,10 @@ sock = makeWASocket({
     generateHighQualityLinkPreview: false,
     getMessage: async () => undefined
   });
+
   sock.ev.on('creds.update', saveCreds);
 
-  sock.ev.on('connection.update', (update) => {
+  sock.ev.on('connection.update', async (update) => {
     const { connection, lastDisconnect, qr } = update;
     const config = getConfig();
 
@@ -190,8 +206,9 @@ sock = makeWASocket({
 
     if (connection === 'close') {
       isConnected = false;
-      const shouldReconnect = (lastDisconnect?.error)?.output?.statusCode !== DisconnectReason.loggedOut;
-      console.log(`[WA Gateway] Terputus. Reconnect: ${shouldReconnect}`);
+      const statusCode = (lastDisconnect?.error)?.output?.statusCode;
+      const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
+      console.log(`[WA Gateway] Terputus (code: ${statusCode}). Reconnect: ${shouldReconnect}`);
 
       if (config.webhook_connect) {
         fetch(config.webhook_connect, {
@@ -201,8 +218,12 @@ sock = makeWASocket({
         }).catch(() => {});
       }
 
-      if (shouldReconnect) setTimeout(startWhatsAppGateway, 3000);
-
+      if (shouldReconnect) {
+        setTimeout(startWhatsAppGateway, 3000);
+      } else {
+        await clearSessionFiles();
+        setTimeout(startWhatsAppGateway, 2000);
+      }
     } else if (connection === 'open') {
       isConnected = true;
       qrCodeString = null;
@@ -224,7 +245,6 @@ sock = makeWASocket({
       const config = getConfig();
 
       for (const msg of m.messages) {
-        // Lewati pesan kosong (gagal decrypt / protocol message) & pesan duplikat
         if (!msg.message) continue;
         if (isDuplicateMessage(msg.key.id)) continue;
         if (msg.key.fromMe && !config.quick_reply) continue;
@@ -242,7 +262,6 @@ sock = makeWASocket({
           await sock.readMessages([msg.key]);
         }
 
-        // Ekstrak isi pesan teks / caption / balasan
         const unwrapMsg = msg.message?.ephemeralMessage?.message
           || msg.message?.viewOnceMessage?.message
           || msg.message?.viewOnceMessageV2?.message
@@ -298,10 +317,8 @@ sock = makeWASocket({
           }
         }
 
-        // Abaikan jika pesan tidak memiliki teks maupun media valid (misal reaction/receipt)
         if (!textMessage && !mediaBuffer && mediaType === 'text') continue;
 
-        // Ambil senderPn dari berbagai sumber termasuk lidMapping
         let senderPn = msg.key.senderPn || msg.key.participantPn || '';
         if (!senderPn && sender?.endsWith('@lid') && sock.signalRepository?.lidMapping?.getPNForLID) {
           try {
@@ -315,7 +332,6 @@ sock = makeWASocket({
         const adminNum = normalizePhone(config.admin_number);
         const adminJid = adminNum ? `${adminNum}@s.whatsapp.net` : null;
 
-        // Simpan otomatis LID milik Admin A ke config.json agar CC & forward selalu akurat
         if (adminJid && cleanSenderNum === adminNum && sender.endsWith('@lid') && config.admin_lid !== sender) {
           config.admin_lid = sender;
           saveConfig(config);
@@ -973,7 +989,7 @@ app.post('/save-config', requireLogin, (req, res) => {
   const config = getConfig();
   const newAdminNum = normalizePhone(req.body.admin_number || '');
   if (newAdminNum !== config.admin_number) {
-    config.admin_lid = ''; // Reset LID lama jika nomor admin diganti
+    config.admin_lid = '';
   }
   config.admin_number = newAdminNum;
   config.cc_outbound_to_admin = req.body.cc_outbound_to_admin === 'on';
@@ -1106,20 +1122,7 @@ app.get('/disconnect', requireLogin, async (req, res) => {
   try { await sock?.logout(); } catch (e) {}
   isConnected = false;
   qrCodeString = null;
-
-  try {
-    if (await fs.pathExists(AUTH_DIR)) {
-      const files = await fs.readdir(AUTH_DIR);
-      for (const file of files) {
-        if (file !== 'config.json' && file !== 'logs.json') {
-          await fs.remove(path.join(AUTH_DIR, file));
-        }
-      }
-    }
-  } catch (err) {
-    console.error('[WA Gateway] Gagal membersihkan file sesi:', err.message);
-  }
-
+  await clearSessionFiles();
   setTimeout(startWhatsAppGateway, 2000);
   res.redirect('/');
 });
